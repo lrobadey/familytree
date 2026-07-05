@@ -1,88 +1,147 @@
 /**
- * Wires the family data into the physics engine, renders the graph on a
- * canvas, and handles interaction (drag, pan, zoom, hover).
+ * The canvas view: builds the physics simulation from the Store, renders it,
+ * and handles interaction (drag, pan, zoom, select). It rebuilds whenever the
+ * Store emits a structural 'change', preserving the positions of nodes that
+ * still exist so the layout doesn't jump around while you edit.
+ *
+ * Selection is view state, exposed on window.TreeView so the inspector can
+ * read/drive it.
  */
 
 (function () {
   const { Node, Bond, Simulation } = window.Physics;
-  const DATA = window.FAMILY_DATA;
+  const Store = window.Store;
 
   const canvas = document.getElementById("stage");
   const ctx = canvas.getContext("2d");
 
-  // ----- View transform (pan + zoom over world coordinates) ----------------
-  const view = { x: 0, y: 0, scale: 1 };
+  // ----- Camera (pan + zoom, with easing toward a target when focusing) ----
+  const view = { x: 0, y: 0, scale: 1, tx: 0, ty: 0, easing: false };
 
-  // ----- Build the simulation from the data --------------------------------
-  const sim = new Simulation({ repulsion: 16000, gravity: 0.0012, damping: 0.85 });
-
-  const personById = new Map(DATA.people.map((p) => [p.id, p]));
-
-  // Person nodes.
-  for (const p of DATA.people) {
-    sim.addNode(new Node(p.id, { kind: "person", radius: 30, data: p }));
+  // ----- Selection ---------------------------------------------------------
+  let selectedId = null;
+  const selectListeners = [];
+  function setSelected(id) {
+    selectedId = id;
+    selectListeners.forEach((cb) => cb(id));
   }
 
-  // Each union gets an invisible anchor node between the partners; children
-  // hang off that anchor. This is the "family system" made physical.
-  for (const u of DATA.unions) {
-    const anchor = sim.addNode(
-      new Node(u.id, { kind: "anchor", radius: 6, mass: 0.6, data: u })
-    );
+  window.TreeView = {
+    getSelected: () => selectedId,
+    select: (id) => setSelected(id),
+    onSelectChange: (cb) => selectListeners.push(cb),
+    focus: (id) => {
+      const n = sim && sim.get(id);
+      if (!n) return;
+      view.tx = -n.x;
+      view.ty = -n.y;
+      view.easing = true;
+    },
+  };
 
-    // Marriage bonds: each partner to the anchor (keeps the couple close and
-    // symmetric around their shared anchor).
-    for (const partnerId of u.partners) {
-      sim.addBond(
-        new Bond(sim.get(partnerId), anchor, {
-          kind: "marriage",
-          length: 70,
-          stiffness: 0.05,
-          visible: false,
-        })
-      );
+  // ----- Build / rebuild the simulation from the Store ---------------------
+  let sim = null;
+
+  function buildSim() {
+    const s = new Simulation({ repulsion: 16000, gravity: 0.0012, damping: 0.85 });
+
+    for (const p of Store.people()) {
+      s.addNode(new Node(p.id, { kind: "person", radius: 30, data: p }));
     }
 
-    // Parent → child bonds run from the anchor to each child. They drive the
-    // physics but are not drawn directly — the visible connector is rendered
-    // from the midpoint of the partnership line so it meets the parents' bond
-    // cleanly (see draw()).
-    for (const childId of u.children || []) {
-      sim.addBond(
-        new Bond(anchor, sim.get(childId), {
-          kind: "parent",
-          length: 150,
-          stiffness: 0.025,
-          visible: false,
-        })
+    for (const u of Store.unions()) {
+      const anchor = s.addNode(
+        new Node(u.id, { kind: "anchor", radius: 6, mass: 0.6, data: u })
       );
+      for (const partnerId of u.partners) {
+        const partner = s.get(partnerId);
+        if (partner) {
+          s.addBond(new Bond(partner, anchor, {
+            kind: "marriage", length: 70, stiffness: 0.05, visible: false }));
+        }
+      }
+      for (const childId of u.children || []) {
+        const child = s.get(childId);
+        if (child) {
+          s.addBond(new Bond(anchor, child, {
+            kind: "parent", length: 150, stiffness: 0.025, visible: false }));
+        }
+      }
     }
+    return s;
   }
 
-  // Give the initial layout a hint so it unfolds instead of exploding:
-  // partners left/right of their anchor, children fanned out below.
-  layoutSeed();
-  function layoutSeed() {
-    for (const u of DATA.unions) {
+  function rebuild() {
+    // Snapshot current positions so surviving nodes stay put.
+    const prev = new Map();
+    if (sim) for (const n of sim.nodes) prev.set(n.id, { x: n.x, y: n.y, vx: n.vx, vy: n.vy });
+
+    dragging = null; // any stale drag target is gone after a rebuild
+    sim = buildSim();
+
+    for (const n of sim.nodes) {
+      const p = prev.get(n.id);
+      if (p) {
+        n.x = p.x; n.y = p.y; n.vx = p.vx; n.vy = p.vy;
+      } else {
+        n._needsSeed = true;
+      }
+    }
+    seedNewNodes();
+
+    // Drop a selection whose person no longer exists.
+    if (selectedId && !Store.getPerson(selectedId)) setSelected(null);
+  }
+
+  /** Give brand-new nodes a sensible starting position based on their role. */
+  function seedNewNodes() {
+    for (const u of Store.unions()) {
       const anchor = sim.get(u.id);
-      const [a, b] = u.partners.map((id) => sim.get(id));
-      if (a) { a.x = anchor.x - 90; a.y = anchor.y - 40; }
-      if (b) { b.x = anchor.x + 90; b.y = anchor.y - 40; }
-      (u.children || []).forEach((id, i, arr) => {
-        const child = sim.get(id);
-        const spread = (i - (arr.length - 1) / 2) * 120;
-        child.x = anchor.x + spread;
-        child.y = anchor.y + 170;
+      const partners = u.partners.map((id) => sim.get(id)).filter(Boolean);
+      const known = partners.find((p) => !p._needsSeed);
+
+      if (anchor && anchor._needsSeed) {
+        const base = known || { x: (Math.random() - 0.5) * 200, y: (Math.random() - 0.5) * 200 };
+        anchor.x = base.x + (known ? 0 : 0);
+        anchor.y = base.y + 30;
+        anchor._needsSeed = false;
+      }
+      partners.forEach((p, i) => {
+        if (p._needsSeed) {
+          p.x = anchor.x + (i === 0 ? -100 : 100);
+          p.y = anchor.y - 30;
+          p._needsSeed = false;
+        }
+      });
+      const kids = (u.children || []).map((id) => sim.get(id)).filter(Boolean);
+      kids.forEach((k, i, arr) => {
+        if (k._needsSeed) {
+          const spread = (i - (arr.length - 1) / 2) * 120;
+          k.x = anchor.x + spread + (Math.random() - 0.5) * 20;
+          k.y = anchor.y + 170;
+          k._needsSeed = false;
+        }
       });
     }
+    // Any leftover unconnected people.
+    for (const n of sim.nodes) {
+      if (n._needsSeed) {
+        n.x = (Math.random() - 0.5) * 150;
+        n.y = (Math.random() - 0.5) * 150;
+        n._needsSeed = false;
+      }
+    }
   }
+
+  Store.on("change", rebuild);
 
   // ----- Rendering ---------------------------------------------------------
   const COLORS = {
     m: { fill: "#3b82f6", glow: "rgba(59,130,246,0.35)" },
     f: { fill: "#ec4899", glow: "rgba(236,72,153,0.35)" },
-    default: { fill: "#8b5cf6", glow: "rgba(139,92,246,0.35)" },
+    x: { fill: "#8b5cf6", glow: "rgba(139,92,246,0.35)" },
   };
+  const colorFor = (g) => COLORS[g] || COLORS.x;
 
   let hovered = null;
 
@@ -91,102 +150,64 @@
     canvas.width = canvas.clientWidth * dpr;
     canvas.height = canvas.clientHeight * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    sim.center = { x: 0, y: 0 };
   }
   window.addEventListener("resize", resize);
 
-  function worldToScreen(wx, wy) {
-    return {
-      x: (wx + view.x) * view.scale + canvas.clientWidth / 2,
-      y: (wy + view.y) * view.scale + canvas.clientHeight / 2,
-    };
-  }
-  function screenToWorld(sx, sy) {
-    return {
-      x: (sx - canvas.clientWidth / 2) / view.scale - view.x,
-      y: (sy - canvas.clientHeight / 2) / view.scale - view.y,
-    };
-  }
+  const worldToScreen = (wx, wy) => ({
+    x: (wx + view.x) * view.scale + canvas.clientWidth / 2,
+    y: (wy + view.y) * view.scale + canvas.clientHeight / 2,
+  });
+  const screenToWorld = (sx, sy) => ({
+    x: (sx - canvas.clientWidth / 2) / view.scale - view.x,
+    y: (sy - canvas.clientHeight / 2) / view.scale - view.y,
+  });
 
   function draw() {
     ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
 
-    // Bonds.
-    for (const bond of sim.bonds) {
-      if (!bond.visible) continue;
-      const a = worldToScreen(bond.a.x, bond.a.y);
-      const b = worldToScreen(bond.b.x, bond.b.y);
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
-      ctx.strokeStyle =
-        bond.kind === "parent" ? "rgba(148,163,184,0.35)" : "rgba(226,232,240,0.5)";
-      ctx.lineWidth = (bond.kind === "parent" ? 1.5 : 2) * view.scale;
-      ctx.stroke();
-    }
+    // Family connectors: partnership line + a stem/branch down to children.
+    for (const u of Store.unions()) {
+      const partners = u.partners.map((id) => sim.get(id)).filter(Boolean);
+      if (!partners.length) continue;
 
-    // Family connectors. For each union we draw, in world space:
-    //   1. the partnership line between the two partners (gold), and
-    //   2. a connector from the MIDPOINT of that line down to each child,
-    //      via a short shared stem, so every child visibly descends from the
-    //      partnership rather than from the hidden anchor.
-    for (const u of DATA.unions) {
-      const [a, b] = u.partners.map((id) => sim.get(id));
-      if (!a || !b) continue;
+      // Origin of this family system: midpoint of the couple (or the single
+      // parent's position).
+      const origin =
+        partners.length >= 2
+          ? { x: (partners[0].x + partners[1].x) / 2, y: (partners[0].y + partners[1].y) / 2 }
+          : { x: partners[0].x, y: partners[0].y };
 
-      // Midpoint of the partnership, in world coordinates.
-      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-
-      // A short stem drops from the midpoint toward the children's average
-      // position; child branches fan out from the end of that stem. Keeping a
-      // shared junction makes the sibling group read as one unit.
       const kids = (u.children || []).map((id) => sim.get(id)).filter(Boolean);
       if (kids.length) {
         const avg = kids.reduce(
-          (acc, k) => ({ x: acc.x + k.x / kids.length, y: acc.y + k.y / kids.length }),
+          (a, k) => ({ x: a.x + k.x / kids.length, y: a.y + k.y / kids.length }),
           { x: 0, y: 0 }
         );
-        // Junction sits ~28px from the midpoint along the midpoint→children
-        // direction, so the stem always leaves the partnership line cleanly.
-        const dx = avg.x - mid.x;
-        const dy = avg.y - mid.y;
+        const dx = avg.x - origin.x;
+        const dy = avg.y - origin.y;
         const len = Math.hypot(dx, dy) || 1;
-        const junction = {
-          x: mid.x + (dx / len) * 28,
-          y: mid.y + (dy / len) * 28,
-        };
+        const junction = { x: origin.x + (dx / len) * 28, y: origin.y + (dy / len) * 28 };
 
-        const mScreen = worldToScreen(mid.x, mid.y);
-        const jScreen = worldToScreen(junction.x, junction.y);
-
+        const o = worldToScreen(origin.x, origin.y);
+        const j = worldToScreen(junction.x, junction.y);
         ctx.strokeStyle = "rgba(148,163,184,0.5)";
         ctx.lineWidth = 1.8 * view.scale;
-
-        // Stem: partnership midpoint -> junction.
-        ctx.beginPath();
-        ctx.moveTo(mScreen.x, mScreen.y);
-        ctx.lineTo(jScreen.x, jScreen.y);
-        ctx.stroke();
-
-        // Branches: junction -> each child.
+        ctx.beginPath(); ctx.moveTo(o.x, o.y); ctx.lineTo(j.x, j.y); ctx.stroke();
         for (const k of kids) {
-          const kScreen = worldToScreen(k.x, k.y);
-          ctx.beginPath();
-          ctx.moveTo(jScreen.x, jScreen.y);
-          ctx.lineTo(kScreen.x, kScreen.y);
-          ctx.stroke();
+          const ks = worldToScreen(k.x, k.y);
+          ctx.beginPath(); ctx.moveTo(j.x, j.y); ctx.lineTo(ks.x, ks.y); ctx.stroke();
         }
       }
 
-      // Partnership line drawn last so it sits crisply on top of the stem.
-      const pa = worldToScreen(a.x, a.y);
-      const pb = worldToScreen(b.x, b.y);
-      ctx.beginPath();
-      ctx.moveTo(pa.x, pa.y);
-      ctx.lineTo(pb.x, pb.y);
-      ctx.strokeStyle = "rgba(251,191,36,0.7)";
-      ctx.lineWidth = 3 * view.scale;
-      ctx.stroke();
+      // Partnership line (only meaningful for a couple).
+      if (partners.length >= 2) {
+        const pa = worldToScreen(partners[0].x, partners[0].y);
+        const pb = worldToScreen(partners[1].x, partners[1].y);
+        ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y);
+        ctx.strokeStyle = "rgba(251,191,36,0.7)";
+        ctx.lineWidth = 3 * view.scale;
+        ctx.stroke();
+      }
     }
 
     // Person nodes.
@@ -194,25 +215,34 @@
       if (node.kind !== "person") continue;
       const p = worldToScreen(node.x, node.y);
       const r = node.radius * view.scale;
-      const c = COLORS[node.data.gender] || COLORS.default;
+      const c = colorFor(node.data.gender);
       const isHover = hovered === node;
+      const isSel = selectedId === node.id;
 
-      // Glow.
+      // Selection ring.
+      if (isSel) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r + 7 * view.scale, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.lineWidth = 2.5 * view.scale;
+        ctx.setLineDash([6 * view.scale, 4 * view.scale]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
       ctx.beginPath();
-      ctx.arc(p.x, p.y, r * (isHover ? 1.5 : 1.25), 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, r * (isHover || isSel ? 1.45 : 1.25), 0, Math.PI * 2);
       ctx.fillStyle = c.glow;
       ctx.fill();
 
-      // Body.
       ctx.beginPath();
       ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
       ctx.fillStyle = c.fill;
       ctx.fill();
       ctx.lineWidth = 2 * view.scale;
-      ctx.strokeStyle = isHover ? "#fff" : "rgba(255,255,255,0.6)";
+      ctx.strokeStyle = isHover || isSel ? "#fff" : "rgba(255,255,255,0.6)";
       ctx.stroke();
 
-      // Label.
       ctx.fillStyle = "#e2e8f0";
       ctx.font = `${Math.max(11, 13 * view.scale)}px "Inter", system-ui, sans-serif`;
       ctx.textAlign = "center";
@@ -223,7 +253,14 @@
 
   // ----- Main loop ---------------------------------------------------------
   function tick() {
-    for (let i = 0; i < 2; i++) sim.step(1); // a couple of substeps per frame
+    for (let i = 0; i < 2; i++) sim.step(1);
+    if (view.easing) {
+      view.x += (view.tx - view.x) * 0.15;
+      view.y += (view.ty - view.y) * 0.15;
+      if (Math.hypot(view.tx - view.x, view.ty - view.y) < 0.5) {
+        view.x = view.tx; view.y = view.ty; view.easing = false;
+      }
+    }
     draw();
     requestAnimationFrame(tick);
   }
@@ -232,6 +269,8 @@
   let dragging = null;
   let panning = false;
   let last = { x: 0, y: 0 };
+  let downAt = { x: 0, y: 0 };
+  let moved = 0;
 
   function nodeAt(sx, sy) {
     const w = screenToWorld(sx, sy);
@@ -243,14 +282,20 @@
     return null;
   }
 
+  const localXY = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+
   canvas.addEventListener("mousedown", (e) => {
-    const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
+    const { x: sx, y: sy } = localXY(e);
+    downAt = { x: sx, y: sy };
+    moved = 0;
     const node = nodeAt(sx, sy);
     if (node) {
       dragging = node;
       node.fixed = true;
+      setSelected(node.id);
     } else {
       panning = true;
     }
@@ -258,17 +303,15 @@
   });
 
   window.addEventListener("mousemove", (e) => {
-    const rect = canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
-
+    const { x: sx, y: sy } = localXY(e);
+    moved += Math.hypot(sx - last.x, sy - last.y);
     if (dragging) {
       const w = screenToWorld(sx, sy);
-      dragging.x = w.x;
-      dragging.y = w.y;
+      dragging.x = w.x; dragging.y = w.y;
     } else if (panning) {
       view.x += (sx - last.x) / view.scale;
       view.y += (sy - last.y) / view.scale;
+      view.tx = view.x; view.ty = view.y; view.easing = false;
     } else {
       hovered = nodeAt(sx, sy);
       canvas.style.cursor = hovered ? "grab" : "default";
@@ -278,28 +321,28 @@
 
   window.addEventListener("mouseup", () => {
     if (dragging) dragging.fixed = false;
+    // A click on empty space (no meaningful drag) clears the selection.
+    if (panning && moved < 4) setSelected(null);
     dragging = null;
     panning = false;
   });
 
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.1 : 0.9;
-    view.scale = Math.min(3, Math.max(0.3, view.scale * factor));
+    view.scale = Math.min(3, Math.max(0.3, view.scale * (e.deltaY < 0 ? 1.1 : 0.9)));
   }, { passive: false });
 
-  // Fit / reset button.
+  // ----- Toolbar wiring owned by the view ----------------------------------
   const resetBtn = document.getElementById("reset");
   if (resetBtn) {
     resetBtn.addEventListener("click", () => {
-      view.x = 0;
-      view.y = 0;
       view.scale = 1;
-      layoutSeed();
+      view.tx = 0; view.ty = 0; view.easing = true;
     });
   }
 
   // ----- Go ----------------------------------------------------------------
   resize();
+  rebuild();
   tick();
 })();

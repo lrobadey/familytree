@@ -10,23 +10,35 @@
   <header class="topbar">
     <h1 class="brand">Family&nbsp;Tree</h1>
     <div class="controls">
-      <span class="hint">drag people · scroll to zoom · drag background to pan</span>
-      <button id="reset" type="button">Reset view</button>
+      <button id="add-person" type="button" class="btn primary">+ Add person</button>
+      <span class="divider"></span>
+      <button id="export" type="button" class="btn">Export</button>
+      <button id="import" type="button" class="btn">Import</button>
+      <button id="clear" type="button" class="btn subtle">Clear</button>
+      <button id="reset" type="button" class="btn">Reset view</button>
+      <input id="import-file" type="file" accept="application/json" hidden />
     </div>
   </header>
 
-  <main class="stage-wrap">
-    <canvas id="stage"></canvas>
-    <div class="legend">
-      <span><i class="dot m"></i> male</span>
-      <span><i class="dot f"></i> female</span>
-      <span><i class="line marriage"></i> partnership</span>
-      <span><i class="line parent"></i> parent → child</span>
-    </div>
+  <main class="workspace">
+    <section class="stage-wrap">
+      <canvas id="stage"></canvas>
+      <div class="hint-bar">drag people · scroll to zoom · drag background to pan · click to select</div>
+      <div class="legend">
+        <span><i class="dot m"></i> male</span>
+        <span><i class="dot f"></i> female</span>
+        <span><i class="dot x"></i> other</span>
+        <span><i class="line marriage"></i> partnership</span>
+        <span><i class="line parent"></i> parent → child</span>
+      </div>
+    </section>
+    <aside class="inspector" id="inspector"></aside>
   </main>
 
   <script src="js/data.js"></script>
   <script src="js/physics.js"></script>
+  <script src="js/store.js"></script>
   <script src="js/main.js"></script>
+  <script src="js/ui.js"></script>
 </body>
 </html>
