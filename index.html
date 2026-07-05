@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Family Tree</title>
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1 class="brand">Family&nbsp;Tree</h1>
+    <div class="controls">
+      <span class="hint">drag people · scroll to zoom · drag background to pan</span>
+      <button id="reset" type="button">Reset view</button>
+    </div>
+  </header>
+
+  <main class="stage-wrap">
+    <canvas id="stage"></canvas>
+    <div class="legend">
+      <span><i class="dot m"></i> male</span>
+      <span><i class="dot f"></i> female</span>
+      <span><i class="line marriage"></i> partnership</span>
+      <span><i class="line parent"></i> parent → child</span>
+    </div>
+  </main>
+
+  <script src="js/data.js"></script>
+  <script src="js/physics.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>
