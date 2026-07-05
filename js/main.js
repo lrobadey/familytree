@@ -43,13 +43,17 @@
       );
     }
 
-    // Parent → child bonds run from the anchor to each child.
+    // Parent → child bonds run from the anchor to each child. They drive the
+    // physics but are not drawn directly — the visible connector is rendered
+    // from the midpoint of the partnership line so it meets the parents' bond
+    // cleanly (see draw()).
     for (const childId of u.children || []) {
       sim.addBond(
         new Bond(anchor, sim.get(childId), {
           kind: "parent",
           length: 150,
           stiffness: 0.025,
+          visible: false,
         })
       );
     }
@@ -121,17 +125,66 @@
       ctx.stroke();
     }
 
-    // Marriage links: draw a soft line directly between partners (through the
-    // hidden anchor) so couples read as a pair.
+    // Family connectors. For each union we draw, in world space:
+    //   1. the partnership line between the two partners (gold), and
+    //   2. a connector from the MIDPOINT of that line down to each child,
+    //      via a short shared stem, so every child visibly descends from the
+    //      partnership rather than from the hidden anchor.
     for (const u of DATA.unions) {
       const [a, b] = u.partners.map((id) => sim.get(id));
       if (!a || !b) continue;
+
+      // Midpoint of the partnership, in world coordinates.
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+
+      // A short stem drops from the midpoint toward the children's average
+      // position; child branches fan out from the end of that stem. Keeping a
+      // shared junction makes the sibling group read as one unit.
+      const kids = (u.children || []).map((id) => sim.get(id)).filter(Boolean);
+      if (kids.length) {
+        const avg = kids.reduce(
+          (acc, k) => ({ x: acc.x + k.x / kids.length, y: acc.y + k.y / kids.length }),
+          { x: 0, y: 0 }
+        );
+        // Junction sits ~28px from the midpoint along the midpoint→children
+        // direction, so the stem always leaves the partnership line cleanly.
+        const dx = avg.x - mid.x;
+        const dy = avg.y - mid.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const junction = {
+          x: mid.x + (dx / len) * 28,
+          y: mid.y + (dy / len) * 28,
+        };
+
+        const mScreen = worldToScreen(mid.x, mid.y);
+        const jScreen = worldToScreen(junction.x, junction.y);
+
+        ctx.strokeStyle = "rgba(148,163,184,0.5)";
+        ctx.lineWidth = 1.8 * view.scale;
+
+        // Stem: partnership midpoint -> junction.
+        ctx.beginPath();
+        ctx.moveTo(mScreen.x, mScreen.y);
+        ctx.lineTo(jScreen.x, jScreen.y);
+        ctx.stroke();
+
+        // Branches: junction -> each child.
+        for (const k of kids) {
+          const kScreen = worldToScreen(k.x, k.y);
+          ctx.beginPath();
+          ctx.moveTo(jScreen.x, jScreen.y);
+          ctx.lineTo(kScreen.x, kScreen.y);
+          ctx.stroke();
+        }
+      }
+
+      // Partnership line drawn last so it sits crisply on top of the stem.
       const pa = worldToScreen(a.x, a.y);
       const pb = worldToScreen(b.x, b.y);
       ctx.beginPath();
       ctx.moveTo(pa.x, pa.y);
       ctx.lineTo(pb.x, pb.y);
-      ctx.strokeStyle = "rgba(251,191,36,0.6)";
+      ctx.strokeStyle = "rgba(251,191,36,0.7)";
       ctx.lineWidth = 3 * view.scale;
       ctx.stroke();
     }
